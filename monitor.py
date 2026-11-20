@@ -1,129 +1,161 @@
-#!/usr/bin/env python3
-"""Poll an FxEmbed/FxTwitter RSS feed and forward eligible posts to Discord."""
+
 import json
 import os
-import re
 import sys
 import urllib.request
 import urllib.error
-import xml.etree.ElementTree as ET
 from pathlib import Path
-from html import unescape
 
-HANDLE = os.getenv("X_HANDLE", "DeItaone").lstrip("@")
+HANDLE = "DeItaone"
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
-FEED_URL = f"https://fxtwitter.com/{HANDLE}/feed.xml"
-STATE_PATH = Path("state.json")
-USER_AGENT = "DeItaoneDiscordBridge/1.0 (GitHub Actions; RSS polling)"
+API_URL = f"https://api.fxtwitter.com/2/profile/{HANDLE}/statuses?count=50"
+STATE = Path("state.json")
+USER_AGENT = "DiscordX-Monitor/1.0"
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=25) as response:
-        return response.read()
-
-def local_name(tag):
-    return tag.rsplit("}", 1)[-1].lower()
-
-def clean_html(value):
-    value = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.I)
-    value = re.sub(r"</p\s*>", "\n\n", value, flags=re.I)
-    value = re.sub(r"<[^>]+>", "", value)
-    return unescape(value).strip()
-
-def parse_feed(xml_bytes):
-    root = ET.fromstring(xml_bytes)
-    entries = []
-    for item in root.iter():
-        if local_name(item.tag) not in ("item", "entry"):
-            continue
-        fields = {}
-        for child in item:
-            key = local_name(child.tag)
-            val = child.attrib.get("href", "") if key == "link" else (child.text or "")
-            if key not in fields:
-                fields[key] = val.strip()
-            elif key == "category":
-                fields[key] += " " + val.strip()
-        link = fields.get("link", "")
-        if not link:
-            continue
-        # Normalize links to canonical X URLs when the feed provides an FxTwitter URL.
-        link = link.replace("https://fxtwitter.com/", "https://x.com/")
-        link = link.replace("https://fixupx.com/", "https://x.com/")
-        guid = fields.get("guid") or fields.get("id") or link
-        title = clean_html(fields.get("title", ""))
-        description = clean_html(fields.get("description") or fields.get("summary") or fields.get("content", ""))
-        text = description or title
-        cats = (fields.get("category", "") + " " + fields.get("type", "")).lower()
-        entries.append({
-            "id": guid, "link": link, "title": title, "text": text,
-            "categories": cats, "published": fields.get("pubdate") or fields.get("published") or fields.get("updated", "")
-        })
-    # Newest first; preserve feed order if dates are not parseable.
-    return entries
-
-def is_reply_or_repost(post):
-    # Only exclude these when the feed explicitly exposes a reliable marker.
-    marker = post["categories"]
-    text = (post["title"] + "\n" + post["text"]).strip()
-    if re.search(r"\b(reply|repost|retweet|retweeted)\b", marker, re.I):
-        return True
-    if re.match(r"^RT\s+@", text, re.I):
-        return True
-    return False
-
-def send_discord(post):
-    content = f"**@{HANDLE}**\n{post['text'][:3500]}\n\n{post['link']}"
-    payload = json.dumps({"content": content, "allowed_mentions": {"parse": []}}).encode()
+def fetch_posts():
     req = urllib.request.Request(
-        WEBHOOK, data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        API_URL,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = response.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 204:
+            return []
+        raise RuntimeError(f"FxTwitter HTTP {e.code}") from e
+
+    if not data:
+        return []
+
+    result = json.loads(data)
+    if result.get("code") != 200:
+        raise RuntimeError(f"API error: {result}")
+
+    posts = result.get("results")
+    if not isinstance(posts, list):
+        raise RuntimeError("API results missing or invalid")
+
+    return posts
+
+
+def is_original(post):
+    if post.get("type") == "tombstone":
+        return False
+
+    if post.get("replying_to"):
+        return False
+
+    if post.get("reposted_by"):
+        return False
+
+    author = post.get("author") or {}
+    screen_name = (author.get("screen_name") or "").lstrip("@")
+
+    if screen_name and screen_name.lower() != HANDLE.lower():
+        return False
+
+    return True
+
+
+def send_to_discord(post):
+    text = post.get("text", "")
+    link = post.get("url", "")
+
+    message = (
+        f"**@{HANDLE}**\n"
+        f"{text[:1600]}\n\n"
+        f"{link}"
+    )
+
+    payload = json.dumps({
+        "content": message,
+        "allowed_mentions": {"parse": []}
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        WEBHOOK,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT
+        },
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=25) as response:
+
+    with urllib.request.urlopen(req, timeout=30) as response:
         if response.status not in (200, 204):
-            raise RuntimeError(f"Discord returned HTTP {response.status}")
+            raise RuntimeError("Discord delivery failed")
+
 
 def main():
-    try:
-        posts = parse_feed(fetch(FEED_URL))
-    except Exception as exc:
-        print(f"ERROR: Could not read feed {FEED_URL}: {exc}", file=sys.stderr)
-        raise
+    posts = fetch_posts()
 
     if not posts:
-        print("Feed contained no entries.")
+        print("API returned no posts.")
         return
 
-    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
-    last_id = state.get("last_id")
+    latest_id = str(posts[0].get("id", ""))
 
-    # First run establishes a baseline and intentionally sends nothing historic.
+    if not latest_id:
+        raise RuntimeError("Latest post has no ID")
+
+    state = (
+        json.loads(STATE.read_text())
+        if STATE.exists()
+        else {}
+    )
+
+    last_id = str(state.get("last_id", ""))
+
+    # First run: establish baseline only.
     if not last_id:
-        STATE_PATH.write_text(json.dumps({"last_id": posts[0]["id"]}, indent=2) + "\n")
-        print(f"Initialized baseline at newest feed item; no historical posts sent. Found {len(posts)} entries.")
+        STATE.write_text(json.dumps({"last_id": latest_id}, indent=2))
+        print("API baseline initialized. No old posts sent.")
         return
 
     new_posts = []
+
     for post in posts:
-        if post["id"] == last_id:
+        post_id = str(post.get("id", ""))
+
+        if post_id == last_id:
             break
-        new_posts.append(post)
+
+        if post_id:
+            new_posts.append(post)
 
     if not new_posts:
         print("No new posts.")
         return
 
-    # Process oldest to newest. Advance the cursor only after successful delivery.
-    for post in reversed(new_posts):
-        if is_reply_or_repost(post):
-            print(f"Skipped marked reply/repost: {post['link']}")
-            continue
-        send_discord(post)
-        print(f"Delivered: {post['link']}")
+    sent = 0
+    skipped = 0
 
-    # Record the newest item, including filtered items, to avoid rechecking forever.
-    STATE_PATH.write_text(json.dumps({"last_id": posts[0]["id"]}, indent=2) + "\n")
+    for post in reversed(new_posts):
+        if not is_original(post):
+            skipped += 1
+            print("Skipped reply or repost:", post.get("id"))
+            continue
+
+        send_to_discord(post)
+        sent += 1
+        print("Delivered:", post.get("url"))
+
+    STATE.write_text(
+        json.dumps({"last_id": latest_id}, indent=2)
+    )
+
+    print(f"Delivered {sent}; skipped {skipped}.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("ERROR:", e, file=sys.stderr)
+        raise
