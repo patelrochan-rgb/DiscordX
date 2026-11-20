@@ -1,0 +1,25 @@
+
+name: Test Discord Webhook
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test message to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "Discord webhook secret is missing"
+            exit 1
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            -H "Content-Type: application/json" \
+            -d '{"content":"DiscordX test successful! @DeItaone monitoring is being configured."}' \
+            "$DISCORD_WEBHOOK_URL"
+
+          echo "Discord test message sent successfully."
