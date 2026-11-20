@@ -2,7 +2,7 @@ name: Monitor DeItaone and forward original posts
 
 on:
   schedule:
-    - cron: "3/5 * * * *"
+    - cron: "7/5 * * * *"
   workflow_dispatch:
 
 permissions:
