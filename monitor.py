@@ -1,4 +1,4 @@
-
+import time
 import json
 import os
 import sys
@@ -19,44 +19,82 @@ STATE = Path("state.json")
 USER_AGENT = "DiscordX-Monitor/1.0"
 
 
+
 def fetch_posts(handle):
     api_url = (
         f"https://api.fxtwitter.com/2/profile/"
         f"{handle}/statuses?count=50"
     )
 
-    req = urllib.request.Request(
-        api_url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json"
-        }
+    delays = [0, 3, 6, 12]
+    last_error = None
+
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            print(
+                f"Retrying @{handle} in {delay} seconds "
+                f"(attempt {attempt}/4)..."
+            )
+            time.sleep(delay)
+
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read()
+
+            if not data:
+                return []
+
+            result = json.loads(data)
+
+            if result.get("code") != 200:
+                raise RuntimeError(
+                    f"API error for @{handle}: {result}"
+                )
+
+            posts = result.get("results")
+
+            if not isinstance(posts, list):
+                raise RuntimeError(
+                    f"API results missing for @{handle}"
+                )
+
+            return posts
+
+        except urllib.error.HTTPError as e:
+            if e.code == 204:
+                return []
+
+            if e.code not in (404, 429, 500, 502, 503, 504):
+                raise RuntimeError(
+                    f"FxTwitter HTTP {e.code} for @{handle}"
+                ) from e
+
+            last_error = e
+            print(
+                f"FxTwitter HTTP {e.code} for @{handle} "
+                f"(attempt {attempt}/4)"
+            )
+
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = e
+            print(
+                f"Connection error for @{handle}: {e} "
+                f"(attempt {attempt}/4)"
+            )
+
+    raise RuntimeError(
+        f"FxTwitter failed for @{handle} after 4 attempts: "
+        f"{last_error}"
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = response.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 204:
-            return []
-        raise RuntimeError(
-            f"FxTwitter HTTP {e.code} for @{handle}"
-        ) from e
-
-    if not data:
-        return []
-
-    result = json.loads(data)
-
-    if result.get("code") != 200:
-        raise RuntimeError(f"API error for @{handle}: {result}")
-
-    posts = result.get("results")
-
-    if not isinstance(posts, list):
-        raise RuntimeError(f"API results missing for @{handle}")
-
-    return posts
 
 
 def is_original(post, handle):
