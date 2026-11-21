@@ -6,13 +6,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-X_HANDLES = [
-    "DeItaone",
-    "WatcherGuru",
-    "BullTheoryio",
-    "KobeissiLetter",
-    "PolymarketMoney",
-]
+HANDLE = "DeItaone"
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 API_URL = f"https://api.fxtwitter.com/2/profile/{HANDLE}/statuses?count=50"
 STATE = Path("state.json")
