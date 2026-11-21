@@ -6,15 +6,27 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-HANDLE = "DeItaone"
+X_HANDLES = [
+    "DeItaone",
+    "WatcherGuru",
+    "BullTheoryio",
+    "KobeissiLetter",
+    "PolymarketMoney",
+]
+
 WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
-API_URL = f"https://api.fxtwitter.com/2/profile/{HANDLE}/statuses?count=50"
 STATE = Path("state.json")
 USER_AGENT = "DiscordX-Monitor/1.0"
 
-def fetch_posts():
+
+def fetch_posts(handle):
+    api_url = (
+        f"https://api.fxtwitter.com/2/profile/"
+        f"{handle}/statuses?count=50"
+    )
+
     req = urllib.request.Request(
-        API_URL,
+        api_url,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json"
@@ -27,23 +39,27 @@ def fetch_posts():
     except urllib.error.HTTPError as e:
         if e.code == 204:
             return []
-        raise RuntimeError(f"FxTwitter HTTP {e.code}") from e
+        raise RuntimeError(
+            f"FxTwitter HTTP {e.code} for @{handle}"
+        ) from e
 
     if not data:
         return []
 
     result = json.loads(data)
+
     if result.get("code") != 200:
-        raise RuntimeError(f"API error: {result}")
+        raise RuntimeError(f"API error for @{handle}: {result}")
 
     posts = result.get("results")
+
     if not isinstance(posts, list):
-        raise RuntimeError("API results missing or invalid")
+        raise RuntimeError(f"API results missing for @{handle}")
 
     return posts
 
 
-def is_original(post):
+def is_original(post, handle):
     if post.get("type") == "tombstone":
         return False
 
@@ -56,18 +72,18 @@ def is_original(post):
     author = post.get("author") or {}
     screen_name = (author.get("screen_name") or "").lstrip("@")
 
-    if screen_name and screen_name.lower() != HANDLE.lower():
+    if screen_name and screen_name.lower() != handle.lower():
         return False
 
     return True
 
 
-def send_to_discord(post):
+def send_to_discord(post, handle):
     text = post.get("text", "")
     link = post.get("url", "")
 
     message = (
-        f"**@{HANDLE}**\n"
+        f"**@{handle}**\n"
         f"{text[:1600]}\n\n"
         f"{link}"
     )
@@ -89,33 +105,55 @@ def send_to_discord(post):
 
     with urllib.request.urlopen(req, timeout=30) as response:
         if response.status not in (200, 204):
-            raise RuntimeError("Discord delivery failed")
+            raise RuntimeError(
+                f"Discord delivery failed for @{handle}"
+            )
 
 
-def main():
-    posts = fetch_posts()
+def load_state():
+    if not STATE.exists():
+        return {"accounts": {}}
+
+    data = json.loads(STATE.read_text())
+
+    # Migrate the original single-account state automatically.
+    if "accounts" not in data:
+        old_id = str(data.get("last_id", ""))
+        accounts = {}
+
+        if old_id:
+            accounts["DeItaone"] = old_id
+
+        return {"accounts": accounts}
+
+    return data
+
+
+def save_state(state):
+    STATE.write_text(json.dumps(state, indent=2))
+
+
+def monitor_account(handle, state):
+    print(f"\nChecking @{handle}...")
+
+    posts = fetch_posts(handle)
 
     if not posts:
-        print("API returned no posts.")
+        print(f"No posts returned for @{handle}.")
         return
 
     latest_id = str(posts[0].get("id", ""))
 
     if not latest_id:
-        raise RuntimeError("Latest post has no ID")
+        raise RuntimeError(f"Latest post has no ID for @{handle}")
 
-    state = (
-        json.loads(STATE.read_text())
-        if STATE.exists()
-        else {}
-    )
+    accounts = state["accounts"]
+    last_id = str(accounts.get(handle, ""))
 
-    last_id = str(state.get("last_id", ""))
-
-    # First run: establish baseline only.
+    # New account: establish baseline without sending old posts.
     if not last_id:
-        STATE.write_text(json.dumps({"last_id": latest_id}, indent=2))
-        print("API baseline initialized. No old posts sent.")
+        accounts[handle] = latest_id
+        print(f"Baseline initialized for @{handle}.")
         return
 
     new_posts = []
@@ -130,32 +168,58 @@ def main():
             new_posts.append(post)
 
     if not new_posts:
-        print("No new posts.")
+        print(f"No new posts from @{handle}.")
+        return
+
+    # If the previous cursor is no longer in the fetched timeline,
+    # reset the baseline instead of repeatedly sending old posts.
+    if not any(str(p.get("id", "")) == last_id for p in posts):
+        accounts[handle] = latest_id
+        print(f"Previous cursor not found. Baseline reset for @{handle}.")
         return
 
     sent = 0
     skipped = 0
 
     for post in reversed(new_posts):
-        if not is_original(post):
+        if not is_original(post, handle):
             skipped += 1
-            print("Skipped reply or repost:", post.get("id"))
+            print(f"Skipped reply/repost from @{handle}: {post.get('id')}")
             continue
 
-        send_to_discord(post)
+        send_to_discord(post, handle)
         sent += 1
-        print("Delivered:", post.get("url"))
+        print(f"Delivered @{handle}: {post.get('url')}")
 
-    STATE.write_text(
-        json.dumps({"last_id": latest_id}, indent=2)
+    accounts[handle] = latest_id
+
+    print(
+        f"@{handle}: delivered {sent}; skipped {skipped}."
     )
 
-    print(f"Delivered {sent}; skipped {skipped}.")
+
+def main():
+    state = load_state()
+
+    errors = []
+
+    for handle in X_HANDLES:
+        try:
+            monitor_account(handle, state)
+        except Exception as e:
+            errors.append(f"@{handle}: {e}")
+            print(f"ERROR monitoring @{handle}: {e}", file=sys.stderr)
+
+    # Save successful account progress and preserve failed cursors.
+    save_state(state)
+
+    if errors:
+        print("\nSome accounts had errors:")
+        for error in errors:
+            print(error)
+    else:
+        print("\nAll accounts checked successfully.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("ERROR:", e, file=sys.stderr)
-        raise
+    main()
