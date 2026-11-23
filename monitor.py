@@ -117,17 +117,17 @@ def is_original(post, handle):
 
 
 def send_to_discord(post, handle):
-    text = post.get("text", "")
     link = post.get("url", "")
 
-    message = (
-        f"**@{handle}**\n"
-        f"{text[:1600]}\n\n"
-        f"{link}"
-    )
+    if not link:
+        post_id = post.get("id", "")
+        if not post_id:
+            raise RuntimeError(f"Post URL and ID missing for @{handle}")
+
+        link = f"https://x.com/{handle}/status/{post_id}"
 
     payload = json.dumps({
-        "content": message,
+        "content": link,
         "allowed_mentions": {"parse": []}
     }).encode("utf-8")
 
@@ -146,6 +146,7 @@ def send_to_discord(post, handle):
             raise RuntimeError(
                 f"Discord delivery failed for @{handle}"
             )
+
 
 
 def load_state():
